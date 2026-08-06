@@ -7,7 +7,7 @@ import traceback
 import io
 from dataclasses import dataclass
 from importlib.metadata import entry_points
-from typing import Any, List, Dict, Optional, Union, BinaryIO
+from typing import Any, List, Dict, Optional, Union, BinaryIO, Sequence, Callable
 from pathlib import Path
 from urllib.parse import urlparse
 from warnings import warn
@@ -61,6 +61,10 @@ PRIORITY_GENERIC_FILE_FORMAT = (
 
 
 _plugins: Union[None, List[Any]] = None  # If None, plugins have not been loaded yet.
+
+_NEWLINE_SPLIT_REGEX = re.compile(r"\r?\n")
+_MULTI_NEWLINE_REGEX = re.compile(r"\n{3,}")
+
 
 
 def _load_plugins() -> Union[None, List[Any]]:
@@ -129,6 +133,8 @@ class MarkItDown:
 
         # Register the converters
         self._converters: List[ConverterRegistration] = []
+        self._sorted_converters: Union[None, List[ConverterRegistration]] = None
+
 
         if (
             enable_builtins is None or enable_builtins
@@ -322,6 +328,95 @@ class MarkItDown:
                 f"Invalid source type: {type(source)}. Expected str, requests.Response, BinaryIO."
             )
 
+    def convert_batch(
+        self,
+        sources: Sequence[Union[str, requests.Response, Path, BinaryIO]],
+        *,
+        max_workers: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int, DocumentConverterResult], None]] = None,
+        **kwargs: Any,
+    ) -> List[DocumentConverterResult]:
+        """
+        Convert a batch of sources in parallel using a thread pool.
+
+        Args:
+            sources: A list of sources (paths, URLs, responses, or binary streams).
+            max_workers: Maximum number of worker threads to use. Defaults to min(32, (os.cpu_count() or 1) + 4).
+            progress_callback: Optional callback invoked as each item completes (completed_count, total_count, result).
+            kwargs: Additional arguments passed to `convert()`.
+
+        Returns:
+            A list of DocumentConverterResult objects corresponding to the input sources.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        if not sources:
+            return []
+
+        completed_count = 0
+        lock = threading.Lock()
+        total = len(sources)
+
+        def _convert_indexed(item: tuple[int, Any]) -> tuple[int, DocumentConverterResult]:
+            nonlocal completed_count
+            idx, src = item
+            res = self.convert(src, **kwargs)
+            if progress_callback is not None:
+                with lock:
+                    completed_count += 1
+                    current = completed_count
+                progress_callback(current, total, res)
+            return idx, res
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            indexed_results = list(executor.map(_convert_indexed, list(enumerate(sources))))
+            indexed_results.sort(key=lambda x: x[0])
+            return [res for _, res in indexed_results]
+
+
+    async def aconvert(
+        self,
+        source: Union[str, requests.Response, Path, BinaryIO],
+        *,
+        stream_info: Optional[StreamInfo] = None,
+        **kwargs: Any,
+    ) -> DocumentConverterResult:
+        """
+        Async version of `convert()`. Runs the synchronous conversion in a thread pool executor.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.convert, source, stream_info=stream_info, **kwargs
+        )
+
+    async def aconvert_batch(
+        self,
+        sources: Sequence[Union[str, requests.Response, Path, BinaryIO]],
+        *,
+        concurrency: int = 4,
+        **kwargs: Any,
+    ) -> List[DocumentConverterResult]:
+        """
+        Async version of batch conversion with controlled concurrency.
+
+        Args:
+            sources: A list of sources to convert.
+            concurrency: Maximum number of concurrent conversions running at once.
+            kwargs: Additional arguments passed to `convert()`.
+        """
+        import asyncio
+
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _worker(src: Any) -> DocumentConverterResult:
+            async with semaphore:
+                return await self.aconvert(src, **kwargs)
+
+        return await asyncio.gather(*[_worker(src) for src in sources])
+
+
     def convert_local(
         self,
         path: Union[str, Path],
@@ -393,12 +488,13 @@ class MarkItDown:
         if not stream.seekable():
             buffer = io.BytesIO()
             while True:
-                chunk = stream.read(4096)
+                chunk = stream.read(65536)
                 if not chunk:
                     break
                 buffer.write(chunk)
             buffer.seek(0)
             stream = buffer
+
 
         # Add guesses based on stream content
         guesses = self._get_stream_info_guesses(
@@ -548,9 +644,10 @@ class MarkItDown:
 
         # Read into BytesIO
         buffer = io.BytesIO()
-        for chunk in response.iter_content(chunk_size=512):
+        for chunk in response.iter_content(chunk_size=65536):
             buffer.write(chunk)
         buffer.seek(0)
+
 
         # Convert
         guesses = self._get_stream_info_guesses(
@@ -566,10 +663,11 @@ class MarkItDown:
         # Keep track of which converters throw exceptions
         failed_attempts: List[FailedConversionAttempt] = []
 
-        # Create a copy of the page_converters list, sorted by priority.
-        # We do this with each call to _convert because the priority of converters may change between calls.
+        # Return cached sorted page_converters list, sorted by priority.
         # The sort is guaranteed to be stable, so converters with the same priority will remain in the same order.
-        sorted_registrations = sorted(self._converters, key=lambda x: x.priority)
+        if self._sorted_converters is None:
+            self._sorted_converters = sorted(self._converters, key=lambda x: x.priority)
+        sorted_registrations = self._sorted_converters
 
         # Remember the initial stream position so that we can return to it
         cur_pos = file_stream.tell()
@@ -639,10 +737,14 @@ class MarkItDown:
                 if res is not None:
                     # Normalize the content
                     res.text_content = "\n".join(
-                        [line.rstrip() for line in re.split(r"\r?\n", res.text_content)]
+                        [
+                            line.rstrip()
+                            for line in _NEWLINE_SPLIT_REGEX.split(res.text_content)
+                        ]
                     )
-                    res.text_content = re.sub(r"\n{3,}", "\n\n", res.text_content)
+                    res.text_content = _MULTI_NEWLINE_REGEX.sub("\n\n", res.text_content)
                     return res
+
 
         # If we got this far without success, report any exceptions
         if len(failed_attempts) > 0:
@@ -692,6 +794,8 @@ class MarkItDown:
         self._converters.insert(
             0, ConverterRegistration(converter=converter, priority=priority)
         )
+        self._sorted_converters = None
+
 
     def _get_stream_info_guesses(
         self, file_stream: BinaryIO, base_guess: StreamInfo

@@ -10,6 +10,8 @@ class DocumentConverterResult:
         markdown: str,
         *,
         title: Optional[str] = None,
+        duration_seconds: Optional[float] = None,
+        converter_name: Optional[str] = None,
     ):
         """
         Initialize the DocumentConverterResult.
@@ -20,9 +22,14 @@ class DocumentConverterResult:
         Parameters:
         - markdown: The converted Markdown text.
         - title: Optional title of the document.
+        - duration_seconds: Optional conversion execution duration in seconds.
+        - converter_name: Optional name of the converter used.
         """
         self.markdown = markdown
         self.title = title
+        self.duration_seconds = duration_seconds
+        self.converter_name = converter_name
+
 
     @property
     def text_content(self) -> str:

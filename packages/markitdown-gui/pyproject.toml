@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "markitdown-gui"
+version = "0.1.0"
+description = "Web GUI for MarkItDown"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "markitdown",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.scripts]
+markitdown-gui = "markitdown_gui.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/markitdown_gui"]
